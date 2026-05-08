@@ -1,6 +1,6 @@
 {
   "domain": "mcp_assist",
-  "name": "MCP Assist",
+  "name": "MCP Assist (Hornwall)",
   "codeowners": ["@mike-nott"],
   "config_flow": true,
   "dependencies": ["conversation", "recorder"],
