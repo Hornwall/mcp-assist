@@ -119,6 +119,8 @@ class MCPAssistConversationEntity(ConversationEntity):
         self._cached_llm_tools: list[dict[str, Any]] | None = None
         self._cached_llm_tools_key: tuple[Any, ...] | None = None
         self._cached_llm_tools_fetched_at = 0.0
+        # Maps prefixed tool name -> (mcp config entry_id, original tool name)
+        self._ha_mcp_tool_routes: dict[str, tuple[str, str]] = {}
 
         # Entity attributes
         profile_name = entry.data.get("profile_name", "MCP Assist")
@@ -430,10 +432,105 @@ class MCPAssistConversationEntity(ConversationEntity):
 
     def _build_mcp_tool_cache_key(self) -> tuple[Any, ...]:
         """Build a cache key for the current MCP tool surface."""
+        ha_mcp_entry_ids = tuple(
+            sorted(
+                entry.entry_id
+                for entry in self.hass.config_entries.async_entries("mcp")
+            )
+        )
         return (
             self.mcp_port,
             self.search_provider,
+            ha_mcp_entry_ids,
         )
+
+    @staticmethod
+    def _slugify_for_tool_prefix(value: str) -> str:
+        """Slugify a config-entry title for use in a tool-name prefix."""
+        slug = re.sub(r"[^a-z0-9]+", "_", (value or "").lower()).strip("_")
+        return (slug or "server")[:20]
+
+    def _collect_ha_mcp_tools(self) -> List[Dict[str, Any]]:
+        """Build LLM-facing tool defs for tools exposed by HA's `mcp` client integration.
+
+        Iterates Home Assistant's built-in MCP client config entries (`mcp` domain)
+        and re-exposes their remote tools to our agent. Routes are recorded in
+        `self._ha_mcp_tool_routes` so `_call_mcp_tool` can dispatch them.
+        """
+        try:
+            from voluptuous_openapi import convert as _vol_convert
+        except Exception:  # pragma: no cover - HA core dep, normally present
+            _vol_convert = None
+
+        routes: dict[str, tuple[str, str]] = {}
+        openai_tools: list[dict[str, Any]] = []
+
+        entries = self.hass.config_entries.async_entries("mcp")
+        for entry in entries:
+            coordinator = getattr(entry, "runtime_data", None)
+            tools = getattr(coordinator, "data", None) if coordinator else None
+            if not tools:
+                continue
+
+            prefix = f"mcp_{self._slugify_for_tool_prefix(entry.title)}__"
+            for tool in tools:
+                original_name = getattr(tool, "name", None)
+                if not original_name:
+                    continue
+
+                prefixed = f"{prefix}{original_name}"
+                # Tool names are constrained: alnum + underscore + dash, <= 64 chars
+                prefixed = re.sub(r"[^A-Za-z0-9_-]", "_", prefixed)[:64]
+
+                if prefixed in routes or prefixed in {
+                    "discover_entities", "get_entity_details", "list_areas",
+                    "list_domains", "get_index", "perform_action",
+                    "set_conversation_state", "run_script", "run_automation",
+                    "get_entity_history",
+                }:
+                    _LOGGER.warning(
+                        "Skipping HA-MCP tool with conflicting name: %s", prefixed
+                    )
+                    continue
+
+                parameters: Dict[str, Any] = {"type": "object", "properties": {}}
+                if _vol_convert is not None and getattr(tool, "parameters", None):
+                    try:
+                        parameters = _vol_convert(tool.parameters)
+                    except Exception as err:
+                        _LOGGER.debug(
+                            "Could not convert schema for HA-MCP tool %s: %s",
+                            prefixed,
+                            err,
+                        )
+
+                description = self._compact_text(
+                    str(
+                        getattr(tool, "description", "")
+                        or f"Remote tool '{original_name}' from MCP server '{entry.title}'."
+                    )
+                )
+
+                openai_tools.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": prefixed,
+                            "description": description,
+                            "parameters": parameters,
+                        },
+                    }
+                )
+                routes[prefixed] = (entry.entry_id, original_name)
+
+        self._ha_mcp_tool_routes = routes
+        if routes:
+            _LOGGER.info(
+                "Exposing %d tool(s) from %d Home Assistant MCP server entry(ies)",
+                len(routes),
+                sum(1 for e in entries if getattr(e, "runtime_data", None)),
+            )
+        return openai_tools
 
     def _compact_tool_result_for_llm(self, tool_name: str, content: Any) -> str:
         """Keep tool results useful while avoiding oversized follow-up payloads."""
@@ -1320,7 +1417,15 @@ class MCPAssistConversationEntity(ConversationEntity):
                         else:
                             _LOGGER.warning("⚠️ perform_action tool NOT found!")
 
-                        return self._convert_mcp_tools_to_llm_tools(tools)
+                        llm_tools = self._convert_mcp_tools_to_llm_tools(tools)
+                        try:
+                            llm_tools.extend(self._collect_ha_mcp_tools())
+                        except Exception as err:
+                            _LOGGER.warning(
+                                "Failed to collect HA-MCP client tools: %s", err
+                            )
+                            self._ha_mcp_tool_routes = {}
+                        return llm_tools
                     return None
 
         except Exception as err:
@@ -1359,6 +1464,10 @@ class MCPAssistConversationEntity(ConversationEntity):
         """Execute a single MCP tool and return the result."""
         _LOGGER.info(f"🔧 Executing MCP tool: {tool_name} with args: {arguments}")
 
+        # Route to Home Assistant's `mcp` client integration if this tool came from there
+        if tool_name in self._ha_mcp_tool_routes:
+            return await self._call_ha_mcp_tool(tool_name, arguments)
+
         try:
             mcp_url = f"http://localhost:{self.mcp_port}"
 
@@ -1395,6 +1504,67 @@ class MCPAssistConversationEntity(ConversationEntity):
         except Exception as e:
             _LOGGER.error(f"Error calling MCP tool {tool_name}: {e}")
             return {"error": str(e)}
+
+    async def _call_ha_mcp_tool(
+        self, tool_name: str, arguments: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Dispatch a tool call to Home Assistant's `mcp` client integration."""
+        route = self._ha_mcp_tool_routes.get(tool_name)
+        if not route:
+            return {"error": f"Unknown HA-MCP tool: {tool_name}"}
+        entry_id, original_name = route
+
+        entry = self.hass.config_entries.async_get_entry(entry_id)
+        if entry is None:
+            return {"error": f"HA-MCP config entry {entry_id} no longer exists"}
+
+        coordinator = getattr(entry, "runtime_data", None)
+        tools = getattr(coordinator, "data", None) if coordinator else None
+        if not tools:
+            return {"error": f"HA-MCP entry '{entry.title}' has no tools loaded"}
+
+        target_tool = next(
+            (t for t in tools if getattr(t, "name", None) == original_name),
+            None,
+        )
+        if target_tool is None:
+            return {
+                "error": f"Tool '{original_name}' not found on HA-MCP server '{entry.title}'"
+            }
+
+        llm_context = llm.LLMContext(
+            platform=DOMAIN,
+            context=None,
+            user_prompt=None,
+            language=None,
+            assistant=conversation.DOMAIN,
+            device_id=None,
+        )
+        try:
+            tool_input = llm.ToolInput(
+                id=None,
+                tool_name=original_name,
+                tool_args=dict(arguments or {}),
+            )
+        except TypeError:
+            # Older HA versions may not have the `id` field on ToolInput
+            tool_input = llm.ToolInput(
+                tool_name=original_name,
+                tool_args=dict(arguments or {}),
+            )
+
+        try:
+            result = await target_tool.async_call(self.hass, tool_input, llm_context)
+        except Exception as err:
+            _LOGGER.error(
+                "HA-MCP tool '%s' on '%s' failed: %s", original_name, entry.title, err
+            )
+            return {"error": str(err)}
+
+        # llm.Tool.async_call typically returns a JSON-serializable dict
+        if isinstance(result, str):
+            return {"content": [{"type": "text", "text": result}]}
+        return {"result": result}
 
     def _normalize_mcp_tool_response(self, result: Any) -> Dict[str, Any]:
         """Normalize an MCP JSON-RPC tool result into one predictable shape."""
