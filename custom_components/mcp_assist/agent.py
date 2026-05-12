@@ -1673,6 +1673,44 @@ class MCPAssistConversationEntity(ConversationEntity):
             _LOGGER.error(f"Error calling MCP tool {tool_name}: {e}")
             return {"error": str(e)}
 
+    def _build_llm_context(self) -> "llm.LLMContext":
+        """Construct an ``llm.LLMContext`` that works across HA versions.
+
+        The dataclass fields have shifted between HA releases (e.g. ``user_prompt``
+        was removed). We probe the available fields and only pass what's accepted.
+        """
+        candidates: dict[str, Any] = {
+            "platform": DOMAIN,
+            "context": None,
+            "user_prompt": None,
+            "language": None,
+            "assistant": conversation.DOMAIN,
+            "device_id": None,
+        }
+
+        accepted_fields: set[str] | None = None
+        try:
+            import dataclasses
+
+            if dataclasses.is_dataclass(llm.LLMContext):
+                accepted_fields = {f.name for f in dataclasses.fields(llm.LLMContext)}
+        except Exception:
+            accepted_fields = None
+
+        if accepted_fields is not None:
+            filtered = {k: v for k, v in candidates.items() if k in accepted_fields}
+            return llm.LLMContext(**filtered)
+
+        # Fallback: try the full signature, then progressively drop fields.
+        for drop in ([], ["user_prompt"], ["user_prompt", "device_id"]):
+            kwargs = {k: v for k, v in candidates.items() if k not in drop}
+            try:
+                return llm.LLMContext(**kwargs)
+            except TypeError:
+                continue
+        # Last resort — minimal context
+        return llm.LLMContext(platform=DOMAIN, context=None)  # type: ignore[call-arg]
+
     async def _call_ha_mcp_tool(
         self, tool_name: str, arguments: Dict[str, Any]
     ) -> Dict[str, Any]:
@@ -1701,14 +1739,7 @@ class MCPAssistConversationEntity(ConversationEntity):
                 "error": f"Tool '{original_name}' not found on HA-MCP server '{entry.title}'"
             }
 
-        llm_context = llm.LLMContext(
-            platform=DOMAIN,
-            context=None,
-            user_prompt=None,
-            language=None,
-            assistant=conversation.DOMAIN,
-            device_id=None,
-        )
+        llm_context = self._build_llm_context()
         try:
             tool_input = llm.ToolInput(
                 id=None,
