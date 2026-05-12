@@ -607,6 +607,43 @@ class MCPAssistConversationEntity(ConversationEntity):
             },
         ]
 
+    def _render_external_servers_hint(self) -> str:
+        """Render a short hint listing the connected external MCP servers.
+
+        Goes into the system prompt so the model has concrete evidence that
+        external tools exist — without this anchor, models tend to refuse
+        toolbox-eligible requests by claiming the capability isn't available.
+        """
+        try:
+            self._rebuild_ha_mcp_catalog()
+        except Exception as err:
+            _LOGGER.debug("External-server hint refresh failed: %s", err)
+
+        catalog = self._ha_mcp_tool_catalog
+        if not catalog:
+            return (
+                "No external MCP servers are connected. Do not call "
+                "search_external_tools or call_external_tool."
+            )
+
+        # Aggregate tool count per server (preserve first-seen order)
+        by_server: dict[str, int] = {}
+        for meta in catalog.values():
+            server = meta["server"]
+            by_server[server] = by_server.get(server, 0) + 1
+
+        lines = [
+            f"- {server} ({count} tool{'s' if count != 1 else ''})"
+            for server, count in by_server.items()
+        ]
+        return (
+            f"Connected external MCP servers ({len(by_server)} server(s), "
+            f"{len(catalog)} tools total):\n"
+            + "\n".join(lines)
+            + "\nWhen a user request maps to any of the above, you MUST call "
+            "search_external_tools before saying you cannot do it."
+        )
+
     def _tool_search_external_tools(
         self, arguments: Dict[str, Any]
     ) -> Dict[str, Any]:
@@ -1436,6 +1473,13 @@ class MCPAssistConversationEntity(ConversationEntity):
 
             # Replace {index} placeholder
             technical_prompt = technical_prompt.replace("{index}", index_json)
+
+            # Replace {external_servers} placeholder with a live hint about
+            # which external MCP servers are connected and how many tools they
+            # expose. Anchors the model so it actually reaches for the toolbox.
+            technical_prompt = technical_prompt.replace(
+                "{external_servers}", self._render_external_servers_hint()
+            )
 
             # Combine: system prompt + technical prompt
             return f"{system_prompt}\n\n{technical_prompt}"
