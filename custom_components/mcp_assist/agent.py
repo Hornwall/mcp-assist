@@ -119,8 +119,9 @@ class MCPAssistConversationEntity(ConversationEntity):
         self._cached_llm_tools: list[dict[str, Any]] | None = None
         self._cached_llm_tools_key: tuple[Any, ...] | None = None
         self._cached_llm_tools_fetched_at = 0.0
-        # Maps prefixed tool name -> (mcp config entry_id, original tool name)
-        self._ha_mcp_tool_routes: dict[str, tuple[str, str]] = {}
+        # Catalog of remote MCP tools exposed via the toolbox meta-tools.
+        # Keyed by prefixed tool name -> metadata for search + dispatch.
+        self._ha_mcp_tool_catalog: dict[str, dict[str, Any]] = {}
 
         # Entity attributes
         profile_name = entry.data.get("profile_name", "MCP Assist")
@@ -450,21 +451,29 @@ class MCPAssistConversationEntity(ConversationEntity):
         slug = re.sub(r"[^a-z0-9]+", "_", (value or "").lower()).strip("_")
         return (slug or "server")[:20]
 
-    def _collect_ha_mcp_tools(self) -> List[Dict[str, Any]]:
-        """Build LLM-facing tool defs for tools exposed by HA's `mcp` client integration.
+    def _rebuild_ha_mcp_catalog(self) -> dict[str, dict[str, Any]]:
+        """Scan HA's `mcp` client integration and (re)build the remote-tool catalog.
 
-        Iterates Home Assistant's built-in MCP client config entries (`mcp` domain)
-        and re-exposes their remote tools to our agent. Routes are recorded in
-        `self._ha_mcp_tool_routes` so `_call_mcp_tool` can dispatch them.
+        Stored in `self._ha_mcp_tool_catalog` keyed by a unique prefixed name:
+            { 'mcp_<server-slug>__<original>': {
+                'entry_id': str, 'server': str, 'original_name': str,
+                'description': str, 'input_schema': dict,
+            } }
         """
         try:
             from voluptuous_openapi import convert as _vol_convert
         except Exception:  # pragma: no cover - HA core dep, normally present
             _vol_convert = None
 
-        routes: dict[str, tuple[str, str]] = {}
-        openai_tools: list[dict[str, Any]] = []
+        reserved_names = {
+            "discover_entities", "get_entity_details", "list_areas",
+            "list_domains", "get_index", "perform_action",
+            "set_conversation_state", "run_script", "run_automation",
+            "get_entity_history",
+            "search_external_tools", "call_external_tool",
+        }
 
+        catalog: dict[str, dict[str, Any]] = {}
         entries = self.hass.config_entries.async_entries("mcp")
         for entry in entries:
             coordinator = getattr(entry, "runtime_data", None)
@@ -478,25 +487,20 @@ class MCPAssistConversationEntity(ConversationEntity):
                 if not original_name:
                     continue
 
-                prefixed = f"{prefix}{original_name}"
-                # Tool names are constrained: alnum + underscore + dash, <= 64 chars
-                prefixed = re.sub(r"[^A-Za-z0-9_-]", "_", prefixed)[:64]
+                prefixed = re.sub(
+                    r"[^A-Za-z0-9_-]", "_", f"{prefix}{original_name}"
+                )[:64]
 
-                if prefixed in routes or prefixed in {
-                    "discover_entities", "get_entity_details", "list_areas",
-                    "list_domains", "get_index", "perform_action",
-                    "set_conversation_state", "run_script", "run_automation",
-                    "get_entity_history",
-                }:
+                if prefixed in catalog or prefixed in reserved_names:
                     _LOGGER.warning(
                         "Skipping HA-MCP tool with conflicting name: %s", prefixed
                     )
                     continue
 
-                parameters: Dict[str, Any] = {"type": "object", "properties": {}}
+                input_schema: Dict[str, Any] = {"type": "object", "properties": {}}
                 if _vol_convert is not None and getattr(tool, "parameters", None):
                     try:
-                        parameters = _vol_convert(tool.parameters)
+                        input_schema = _vol_convert(tool.parameters)
                     except Exception as err:
                         _LOGGER.debug(
                             "Could not convert schema for HA-MCP tool %s: %s",
@@ -504,33 +508,168 @@ class MCPAssistConversationEntity(ConversationEntity):
                             err,
                         )
 
-                description = self._compact_text(
-                    str(
-                        getattr(tool, "description", "")
-                        or f"Remote tool '{original_name}' from MCP server '{entry.title}'."
-                    )
+                description = str(
+                    getattr(tool, "description", "")
+                    or f"Remote tool '{original_name}' from MCP server '{entry.title}'."
                 )
 
-                openai_tools.append(
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": prefixed,
-                            "description": description,
-                            "parameters": parameters,
-                        },
-                    }
-                )
-                routes[prefixed] = (entry.entry_id, original_name)
+                catalog[prefixed] = {
+                    "entry_id": entry.entry_id,
+                    "server": entry.title,
+                    "original_name": original_name,
+                    "description": description,
+                    "input_schema": input_schema,
+                }
 
-        self._ha_mcp_tool_routes = routes
-        if routes:
+        self._ha_mcp_tool_catalog = catalog
+        if catalog:
             _LOGGER.info(
-                "Exposing %d tool(s) from %d Home Assistant MCP server entry(ies)",
-                len(routes),
+                "Toolbox catalog: %d remote MCP tool(s) across %d server entry(ies)",
+                len(catalog),
                 sum(1 for e in entries if getattr(e, "runtime_data", None)),
             )
-        return openai_tools
+        return catalog
+
+    def _build_toolbox_meta_tools(self) -> List[Dict[str, Any]]:
+        """Return the meta-tools that let the LLM browse and invoke remote MCP tools.
+
+        Two tools are exposed regardless of catalog contents (so the LLM gets a
+        consistent surface, and `search_external_tools` will tell it when no
+        servers are configured):
+
+          • `search_external_tools(query?, server?, limit?)` — fuzzy search the
+            catalog, returns name/server/description/inputSchema for matches.
+          • `call_external_tool(name, arguments?)` — invoke a specific tool by
+            its prefixed name from a search result.
+        """
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_external_tools",
+                    "description": (
+                        "Search for tools exposed by external MCP servers connected through "
+                        "Home Assistant's Model Context Protocol integration. Returns matching "
+                        "tools with their name, server, description, and input schema. Call "
+                        "this FIRST to find an external tool, then use `call_external_tool` "
+                        "to invoke it. Leave `query` empty to list everything (up to `limit`)."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Case-insensitive substring matched against tool name and description. Omit or leave empty to list all tools.",
+                            },
+                            "server": {
+                                "type": "string",
+                                "description": "Restrict matches to a specific MCP server title (substring match).",
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Maximum number of matches to return (default 10, max 30).",
+                                "default": 10,
+                                "minimum": 1,
+                                "maximum": 30,
+                            },
+                        },
+                        "required": [],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "call_external_tool",
+                    "description": (
+                        "Invoke a tool previously located via `search_external_tools`. Pass "
+                        "the exact `name` from the search result and an `arguments` object "
+                        "matching that tool's input schema."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "The exact tool name returned by `search_external_tools` (e.g. `mcp_my_server__some_action`).",
+                            },
+                            "arguments": {
+                                "type": "object",
+                                "description": "Arguments object conforming to the tool's input schema.",
+                                "additionalProperties": True,
+                            },
+                        },
+                        "required": ["name"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+        ]
+
+    def _tool_search_external_tools(
+        self, arguments: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Implement `search_external_tools` against the cached catalog."""
+        query = str(arguments.get("query") or "").strip().lower()
+        server_filter = str(arguments.get("server") or "").strip().lower()
+        try:
+            limit = int(arguments.get("limit") or 10)
+        except (TypeError, ValueError):
+            limit = 10
+        limit = max(1, min(30, limit))
+
+        catalog = self._ha_mcp_tool_catalog
+        if not catalog:
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "No external MCP servers are connected. Add one via "
+                            "Settings → Devices & Services → Add Integration → Model Context Protocol."
+                        ),
+                    }
+                ],
+                "structuredContent": {"matches": [], "total": 0},
+            }
+
+        matches: list[dict[str, Any]] = []
+        for name, meta in catalog.items():
+            if server_filter and server_filter not in meta["server"].lower():
+                continue
+            if query:
+                haystack = f"{name}\n{meta['description']}".lower()
+                if query not in haystack:
+                    continue
+            matches.append(
+                {
+                    "name": name,
+                    "server": meta["server"],
+                    "description": meta["description"],
+                    "inputSchema": meta["input_schema"],
+                }
+            )
+
+        total = len(matches)
+        matches = matches[:limit]
+
+        summary_lines = [
+            f"Found {total} external tool(s){' (showing ' + str(len(matches)) + ')' if total > len(matches) else ''}."
+        ]
+        for m in matches:
+            short_desc = self._compact_text(m["description"])
+            summary_lines.append(f"- {m['name']}  [{m['server']}]\n    {short_desc}")
+        text = "\n".join(summary_lines) if matches else "No matching external tools."
+
+        return {
+            "content": [{"type": "text", "text": text}],
+            "structuredContent": {
+                "matches": matches,
+                "total": total,
+                "returned": len(matches),
+            },
+        }
 
     def _compact_tool_result_for_llm(self, tool_name: str, content: Any) -> str:
         """Keep tool results useful while avoiding oversized follow-up payloads."""
@@ -1419,12 +1558,13 @@ class MCPAssistConversationEntity(ConversationEntity):
 
                         llm_tools = self._convert_mcp_tools_to_llm_tools(tools)
                         try:
-                            llm_tools.extend(self._collect_ha_mcp_tools())
+                            self._rebuild_ha_mcp_catalog()
+                            llm_tools.extend(self._build_toolbox_meta_tools())
                         except Exception as err:
                             _LOGGER.warning(
-                                "Failed to collect HA-MCP client tools: %s", err
+                                "Failed to build external MCP toolbox: %s", err
                             )
-                            self._ha_mcp_tool_routes = {}
+                            self._ha_mcp_tool_catalog = {}
                         return llm_tools
                     return None
 
@@ -1464,9 +1604,37 @@ class MCPAssistConversationEntity(ConversationEntity):
         """Execute a single MCP tool and return the result."""
         _LOGGER.info(f"🔧 Executing MCP tool: {tool_name} with args: {arguments}")
 
-        # Route to Home Assistant's `mcp` client integration if this tool came from there
-        if tool_name in self._ha_mcp_tool_routes:
-            return await self._call_ha_mcp_tool(tool_name, arguments)
+        # Toolbox meta-tools for browsing/invoking remote MCP server tools
+        if tool_name == "search_external_tools":
+            # Refresh the catalog lazily so newly-added servers are visible without
+            # waiting for the schema cache to expire.
+            try:
+                self._rebuild_ha_mcp_catalog()
+            except Exception as err:
+                _LOGGER.debug("Catalog refresh during search failed: %s", err)
+            return self._tool_search_external_tools(arguments)
+
+        if tool_name == "call_external_tool":
+            target = str(arguments.get("name") or "").strip()
+            if not target:
+                return {"error": "`name` is required (use search_external_tools first)"}
+            inner_args = arguments.get("arguments") or {}
+            if not isinstance(inner_args, dict):
+                return {"error": "`arguments` must be an object"}
+            if target not in self._ha_mcp_tool_catalog:
+                # Catalog may be stale — try one refresh before giving up
+                try:
+                    self._rebuild_ha_mcp_catalog()
+                except Exception:
+                    pass
+            if target not in self._ha_mcp_tool_catalog:
+                return {
+                    "error": (
+                        f"Unknown external tool '{target}'. Call search_external_tools "
+                        "to see what is available."
+                    )
+                }
+            return await self._call_ha_mcp_tool(target, inner_args)
 
         try:
             mcp_url = f"http://localhost:{self.mcp_port}"
@@ -1509,10 +1677,11 @@ class MCPAssistConversationEntity(ConversationEntity):
         self, tool_name: str, arguments: Dict[str, Any]
     ) -> Dict[str, Any]:
         """Dispatch a tool call to Home Assistant's `mcp` client integration."""
-        route = self._ha_mcp_tool_routes.get(tool_name)
-        if not route:
+        meta = self._ha_mcp_tool_catalog.get(tool_name)
+        if not meta:
             return {"error": f"Unknown HA-MCP tool: {tool_name}"}
-        entry_id, original_name = route
+        entry_id = meta["entry_id"]
+        original_name = meta["original_name"]
 
         entry = self.hass.config_entries.async_get_entry(entry_id)
         if entry is None:
